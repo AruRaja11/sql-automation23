@@ -394,10 +394,16 @@ class SQLAssistantApp(QMainWindow):
         self.db_name_input.setPlaceholderText("Database Name / Path")
         clayout.addWidget(self.db_name_input)
         
-        # Set defaults for user ease
-        self.host_input.setText("localhost")
-        self.user_input.setText("root")
-        self.db_name_input.setText("test.db")
+        # Set defaults from config for user ease
+        db_type_map = {"sqlite": "SQLite", "postgres": "PostgreSQL", "mysql": "MySQL"}
+        default_idx = self.db_type.findText(db_type_map.get(config.DB_TYPE.lower(), "SQLite"))
+        if default_idx >= 0:
+            self.db_type.setCurrentIndex(default_idx)
+
+        self.host_input.setText(config.DB_CONFIG.get("host", "localhost"))
+        self.user_input.setText(config.DB_CONFIG.get("user", "root"))
+        self.pass_input.setText(config.DB_CONFIG.get("password", ""))
+        self.db_name_input.setText(config.DB_CONFIG.get("database", "test.db"))
         
         self.connect_btn = QPushButton("Sync Connection")
         self.connect_btn.setStyleSheet(f"""
@@ -508,19 +514,41 @@ class SQLAssistantApp(QMainWindow):
             db_type = self.db_type.currentText()
             h, u, p, d = self.host_input.text(), self.user_input.text(), self.pass_input.text(), self.db_name_input.text()
             
+                
             if db_type == "SQLite":
                 self.conn = sqlite3.connect(d)
             elif db_type == "PostgreSQL":
-                self.conn = psycopg2.connect(host=h, user=u, password=p, dbname=d)
+                # Handle port if it looks like host:port
+                if ":" in h:
+                    host, port = h.split(":")
+                    self.conn = psycopg2.connect(host=host, port=port, user=u, password=p, dbname=d)
+                else:
+                    self.conn = psycopg2.connect(host=h, user=u, password=p, dbname=d)
             elif db_type == "MySQL":
-                self.conn = mysql.connector.connect(host=h, user=u, password=p, database=d)
+                # Handle port if provided in config or host string
+                port = 3306
+                if ":" in h:
+                    h, port = h.split(":")
+                elif "port" in config.DB_CONFIG:
+                    port = config.DB_CONFIG["port"]
+                    
+                self.conn = mysql.connector.connect(
+                    host=h, 
+                    port=port,
+                    user=u, 
+                    password=p, 
+                    database=d
+                )
                 
-            self.conn_status_label.setText("CONNECTED")
-            self.conn_status_label.setStyleSheet(f"color: {ACCENT_GREEN}; font-size: 11px; font-weight: 700;")
-            self.status_bar.showMessage("Neural Sync Success", 2000)
-            self.refresh_tables()
+            if self.conn.is_connected():
+                self.conn_status_label.setText("connected")
+                self.conn_status_label.setStyleSheet(f"color: {ACCENT_GREEN}; font-size: 11px; font-weight: 700;")
+                self.status_bar.showMessage("Neural Sync Success", 2000)
+                self.refresh_tables()
+            else:
+                raise Exception("Failed to establish connection")
         except Exception as e:
-            self.conn_status_label.setText("CONNECTION FAILED")
+            self.conn_status_label.setText("not connected")
             self.conn_status_label.setStyleSheet(f"color: {ACCENT_RED}; font-size: 11px; font-weight: 700;")
             self.status_bar.showMessage(f"Sync Fail: {e}")
 
@@ -558,7 +586,7 @@ class SQLAssistantApp(QMainWindow):
             self.editor_status.setText("EXECUTION SUCCESS")
             self.editor_status.setStyleSheet(f"color: {ACCENT_GREEN}; font-size: 11px; font-weight: 700;")
             
-            if any(m in sql.upper() for m in ["INSERT", "UPDATE", "DELETE", "CREATE", "DROP"]):
+            if any(m in sql.upper() for m in ["INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "TRUNCATE"]):
                 self.conn.commit()
                 self.refresh_tables()
                 return
