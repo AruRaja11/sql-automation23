@@ -3,6 +3,7 @@ import os
 import re
 import sqlite3
 import psycopg2
+import mysql.connector
 import ollama
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
@@ -17,14 +18,17 @@ from pygments import highlight
 from pygments.lexers import SqlLexer
 from pygments.formatters import HtmlFormatter
 
-# --- UI Constants (Streva Style) ---
-PRIMARY_PURPLE = "#8B5CF6"
-SECONDARY_PURPLE = "#6366F1"
-BG_DARK = "#0F172A"
-CARD_BG = "#1E293B"
-TEXT_WHITE = "#F8FAFC"
+# --- UI Constants (Premium Light Theme) ---
+PRIMARY_BLUE = "#2563EB"    # Sharp Professional Blue
+SECONDARY_BLUE = "#3B82F6"  # Lighter Accent Blue
+BG_LIGHT = "#FFFFFF"        # Pure White
+PANEL_BG = "#F8FAFC"        # Very Soft Gray
+CARD_BG = "#FFFFFF"         # Card Background
+TEXT_MAIN = "#0F172A"       # Deep Slate for text
+TEXT_SUBTLE = "#64748B"     # Slate for secondary text
 ACCENT_GREEN = "#10B981"
 ACCENT_RED = "#EF4444"
+BORDER_COLOR = "#E2E8F0"    # Light border
 
 class ChatBubble(QFrame):
     def __init__(self, text, is_user=True):
@@ -41,48 +45,47 @@ class ChatBubble(QFrame):
         if is_user:
             self.setStyleSheet(f"""
                 QFrame {{
-                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {PRIMARY_PURPLE}, stop:1 {SECONDARY_PURPLE});
-                    border-radius: 20px;
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {PRIMARY_BLUE}, stop:1 {SECONDARY_BLUE});
+                    border-radius: 18px;
                     border-bottom-right-radius: 4px;
                 }}
                 QLabel {{ 
                     color: white; 
                     font-size: 14px; 
                     background: transparent; 
-                    line-height: 1.4;
+                    line-height: 1.5;
+                    font-weight: 500;
                 }}
             """)
         else:
             self.setStyleSheet(f"""
                 QFrame {{
-                    background-color: {CARD_BG};
-                    border: 1px solid #334155;
-                    border-radius: 20px;
+                    background-color: #F1F5F9;
+                    border: 1px solid {BORDER_COLOR};
+                    border-radius: 18px;
                     border-bottom-left-radius: 4px;
                 }}
                 QLabel {{ 
-                    color: {TEXT_WHITE}; 
+                    color: {TEXT_MAIN}; 
                     font-size: 14px; 
                     background: transparent; 
-                    line-height: 1.4;
+                    line-height: 1.5;
                 }}
             """)
         
         layout.addWidget(self.label)
-        
-        # Sizing Policy
-        self.setFixedWidth(400) # Keep width fixed but allow height to expand naturally
+        self.setFixedWidth(420)
         self.setSizePolicy(QTableWidget.sizePolicy(self).horizontalPolicy(), QTableWidget.sizePolicy(self).verticalPolicy().Preferred)
 
-        # Subtle shadow
+        # Soft shadow for bubbles
         shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(15)
-        shadow.setColor(QColor(0, 0, 0, 80))
+        shadow.setBlurRadius(20)
+        shadow.setColor(QColor(0, 0, 0, 15))
         shadow.setOffset(0, 4)
         self.setGraphicsEffect(shadow)
 
 class AILogicThread(QThread):
-    response_ready = pyqtSignal(str, str) # text, identified_task
+    response_ready = pyqtSignal(str, str)
     error_signal = pyqtSignal(str)
 
     def __init__(self, history, current_task):
@@ -94,39 +97,23 @@ class AILogicThread(QThread):
         try:
             task_context = f"CURRENT TASK OBJECTIVE: {self.current_task}\n" if self.current_task else ""
             system_prompt = (
-                "You are the Streva SQL Intelligence.\n"
+                "You are the SQL Intelligence. Focus ONLY on providing clean, executable SQL code.\n"
                 f"{task_context}"
-                "INSTRUCTIONS:\n"
-                "1. If context is missing, ask: 'Do you want a generic SQL template, or should we build this for your real-time database? If it's for your database, please provide the Domain, Table, and Fields.'\n"
-                "2. 'All columns' or '*' is a valid input for Fields.\n"
-                "3. ONCE YOU HAVE Domain, Table, and Fields (even if they were provided in the first message), PROCEED IMMEDIATELY to generate the SQL in a ```sql block.\n"
-                "4. DO NOT repeat the clarification question once the information has been provided.\n"
-                "5. Use the TASK_OBJECTIVE tag at the end.\n"
-                "\n"
-                "EXAMPLE:\n"
-                "User: 'Select all columns from users in domain prod'\n"
-                "AI: 'Understood. Generating the query for your real-time database.'\n"
-                "```sql\nSELECT * FROM users;\n```\n"
-                "TASK_OBJECTIVE: Selecting all columns from the users table."
+                "CRITICAL INSTRUCTIONS:\n"
+                "1. DO NOT generate ASCII tables, example data, or markdown tables (+---+|).\n"
+                "2. Provide only SQL code blocks for the user to execute.\n"
+                "3. If database context is missing, ask for Host, Username, and Table.\n"
+                "4. End with TASK_OBJECTIVE: [short description]"
             )
-            
             messages = [{"role": "system", "content": system_prompt}]
             messages.extend(self.history)
-            
-            response = ollama.chat(
-                model=config.LLAMA_MODEL_NAME,
-                messages=messages
-            )
-            
+            response = ollama.chat(model=config.LLAMA_MODEL_NAME, messages=messages)
             content = response['message']['content']
-            
-            # Parse identified task
             new_task = self.current_task
             task_match = re.search(r'TASK_OBJECTIVE:\s*(.*)', content, re.IGNORECASE)
             if task_match:
                 new_task = task_match.group(1).strip()
                 content = content.replace(task_match.group(0), "").strip()
-                
             self.response_ready.emit(content, new_task)
         except Exception as e:
             self.error_signal.emit(str(e))
@@ -134,69 +121,32 @@ class AILogicThread(QThread):
 class SQLAssistantApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Streva SQL Assistant")
-        self.setMinimumSize(1300, 900)
-        
-        # State
+        self.setWindowTitle("SQL Studio")
+        self.setMinimumSize(1400, 950)
         self.conversation_history = []
         self.current_objective = None
         
-        # Global Stylesheet
-        self.setStyleSheet(f"""
-            QMainWindow {{ background-color: {BG_DARK}; }}
-            QWidget {{ font-family: 'Inter', -apple-system, sans-serif; }}
-            QLabel#panel_header {{ color: white; font-weight: 800; font-size: 18px; }}
-            
-            QLineEdit {{
-                background-color: #1E293B;
-                border: 1px solid #334155;
-                border-radius: 25px;
-                padding: 12px 20px;
-                color: white;
-                font-size: 14px;
-            }}
-            QLineEdit:focus {{ border: 1px solid {PRIMARY_PURPLE}; }}
-            
-            QPushButton {{
-                background-color: {PRIMARY_PURPLE};
-                color: white;
-                border-radius: 12px;
-                font-weight: bold;
-                padding: 10px 20px;
-            }}
-            QPushButton:hover {{ background-color: {SECONDARY_PURPLE}; }}
-            
-            QTextBrowser {{
-                background-color: {BG_DARK};
-                border: 1px solid #334155;
-                border-radius: 15px;
-                padding: 10px;
-            }}
-            
-            QTableWidget {{
-                background-color: {CARD_BG};
-                color: white;
-                gridline-color: #334155;
-                border: 1px solid #334155;
-                border-radius: 12px;
-            }}
-            QHeaderView::section {{
-                background-color: #0F172A;
-                color: #94A3B8;
-                padding: 10px;
-                border: none;
-                font-weight: bold;
-            }}
-        """)
+        self._apply_global_styles()
         
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.main_layout = QHBoxLayout(self.central_widget)
-        self.main_layout.setContentsMargins(20, 20, 20, 20)
-        self.main_layout.setSpacing(20)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+        self.main_layout.setSpacing(0)
+        
+        # Sidebar (Minimalist Icons)
+        self.sidebar = self.create_sidebar()
+        self.main_layout.addWidget(self.sidebar)
+        
+        # Content Area
+        self.content_area = QWidget()
+        self.content_layout = QVBoxLayout(self.content_area)
+        self.content_layout.setContentsMargins(24, 24, 24, 24)
+        self.content_layout.setSpacing(24)
         
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.splitter.setHandleWidth(2)
+        self.splitter.setHandleWidth(4)
+        self.splitter.setStyleSheet("QSplitter::handle { background: transparent; }")
         
         self.panel_1 = self.create_chat_panel()
         self.panel_2 = self.create_editor_panel()
@@ -205,36 +155,121 @@ class SQLAssistantApp(QMainWindow):
         self.splitter.addWidget(self.panel_1)
         self.splitter.addWidget(self.panel_2)
         self.splitter.addWidget(self.panel_3)
-        self.splitter.setSizes([450, 500, 350])
+        self.splitter.setSizes([450, 550, 400])
         
-        self.main_layout.addWidget(self.splitter)
+        self.content_layout.addWidget(self.splitter)
+        self.main_layout.addWidget(self.content_area)
         
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.setStyleSheet("color: #64748B; background: transparent; border: none; font-size: 12px;")
-        self.status_bar.showMessage("Ready to design queries...")
+        self.status_bar.setStyleSheet(f"color: {TEXT_SUBTLE}; background: {BG_LIGHT}; border-top: 1px solid {BORDER_COLOR}; padding: 5px;")
+        self.status_bar.showMessage("SQL Intelligence Online")
+
+    def _apply_global_styles(self):
+        self.setStyleSheet(f"""
+            QMainWindow {{ background-color: {BG_LIGHT}; }}
+            QWidget {{ font-family: 'Inter', sans-serif; color: {TEXT_MAIN}; }}
+            
+            QLabel#panel_header {{ font-weight: 800; font-size: 18px; color: {TEXT_MAIN}; letter-spacing: -0.5px; }}
+            
+            QLineEdit {{
+                background-color: {BG_LIGHT};
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 12px;
+                padding: 12px 16px;
+                color: {TEXT_MAIN};
+                font-size: 14px;
+            }}
+            QLineEdit:focus {{ border: 1px solid {PRIMARY_BLUE}; }}
+            
+            QPushButton {{
+                background-color: {PRIMARY_BLUE};
+                color: white;
+                border-radius: 10px;
+                font-weight: 700;
+                padding: 10px 20px;
+                font-size: 13px;
+            }}
+            QPushButton:hover {{ background-color: {SECONDARY_BLUE}; }}
+            
+            QComboBox {{
+                background-color: white;
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 8px;
+                padding: 6px 10px;
+                color: {TEXT_MAIN};
+            }}
+            
+            QTableWidget {{
+                background-color: white;
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 12px;
+                gridline-color: #F1F5F9;
+                color: {TEXT_MAIN};
+            }}
+            QHeaderView::section {{
+                background-color: #F8FAFC;
+                color: {TEXT_SUBTLE};
+                padding: 12px;
+                border: none;
+                border-bottom: 1px solid {BORDER_COLOR};
+                font-weight: 700;
+                text-transform: uppercase;
+                font-size: 11px;
+            }}
+            
+            /* Custom Scrollbar */
+            QScrollBar:vertical {{
+                border: none;
+                background: transparent;
+                width: 5px;
+            }}
+            QScrollBar::handle:vertical {{
+                background: #CBD5E1;
+                border-radius: 2px;
+            }}
+        """)
+
+    def create_sidebar(self):
+        bar = QFrame()
+        bar.setFixedWidth(64)
+        bar.setStyleSheet(f"background-color: #F8FAFC; border-right: 1px solid {BORDER_COLOR};")
+        layout = QVBoxLayout(bar)
+        layout.setContentsMargins(0, 40, 0, 40)
+        layout.setSpacing(32)
+        
+        for icon_text in ["◈", "⊞", "⚛", "▦"]:
+            btn = QLabel(icon_text)
+            btn.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            btn.setStyleSheet(f"font-size: 22px; color: #94A3B8;")
+            if icon_text == "◈": btn.setStyleSheet(f"font-size: 22px; color: {PRIMARY_BLUE};")
+            layout.addWidget(btn)
+        
+        layout.addStretch()
+        return bar
 
     def create_chat_panel(self):
         panel = QFrame()
+        panel.setStyleSheet(f"background-color: {PANEL_BG}; border-radius: 24px;")
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(15)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(20)
         
         header_layout = QHBoxLayout()
-        header = QLabel("AI Intelligence")
+        header = QLabel("Neural Chat")
         header.setObjectName("panel_header")
         
-        self.new_task_btn = QPushButton("Complete Task")
+        self.new_task_btn = QPushButton("Reset Task")
         self.new_task_btn.setStyleSheet(f"""
             QPushButton {{ 
-                background-color: {PRIMARY_PURPLE}; 
-                border: none; 
+                background-color: white; 
+                border: 1px solid {BORDER_COLOR}; 
                 padding: 8px 16px; 
-                border-radius: 12px; 
-                font-size: 13px;
-                color: white;
+                border-radius: 8px; 
+                font-size: 12px;
+                color: {TEXT_SUBTLE};
             }}
-            QPushButton:hover {{ background-color: {ACCENT_RED}; }}
+            QPushButton:hover {{ background-color: {ACCENT_RED}; color: white; border-color: {ACCENT_RED}; }}
         """)
         self.new_task_btn.clicked.connect(self.handle_new_task)
         
@@ -243,40 +278,35 @@ class SQLAssistantApp(QMainWindow):
         header_layout.addWidget(self.new_task_btn)
         layout.addLayout(header_layout)
         
-        # Context Window (Objective Display)
         self.objective_display = QFrame()
         self.objective_display.setStyleSheet(f"""
             QFrame {{
-                background-color: rgba(139, 92, 246, 0.08);
-                border: 1px dashed {PRIMARY_PURPLE};
+                background-color: #EFF6FF;
+                border: 1px solid #DBEAFE;
                 border-radius: 16px;
-                padding: 12px;
+                padding: 16px;
             }}
         """)
         obj_layout = QVBoxLayout(self.objective_display)
         self.obj_label = QLabel("Current Objective: Waiting for input...")
-        self.obj_label.setStyleSheet(f"color: white; font-weight: 600; font-size: 13px;")
-        
-        info_sub = QLabel("AI will focus on this goal until you complete the task.")
-        info_sub.setStyleSheet("color: #94A3B8; font-size: 11px;")
-        
+        self.obj_label.setWordWrap(True)
+        self.obj_label.setStyleSheet(f"color: {PRIMARY_BLUE}; font-weight: 700; font-size: 13px;")
         obj_layout.addWidget(self.obj_label)
-        obj_layout.addWidget(info_sub)
         layout.addWidget(self.objective_display)
         
         self.chat_history_area = QScrollArea()
         self.chat_history_area.setWidgetResizable(True)
         self.chat_history_area.setStyleSheet("background: transparent; border: none;")
         self.chat_content = QWidget()
-        self.chat_content.setStyleSheet("background: transparent;")
         self.chat_content_layout = QVBoxLayout(self.chat_content)
-        self.chat_content_layout.setSpacing(15)
         self.chat_content_layout.addStretch()
         self.chat_history_area.setWidget(self.chat_content)
         layout.addWidget(self.chat_history_area)
         
         self.chat_input = QLineEdit()
-        self.chat_input.setPlaceholderText("Describe your SQL task...")
+        self.chat_input.setPlaceholderText("Describe your SQL requirements...")
+        self.chat_input.setFixedHeight(54)
+        self.chat_input.setStyleSheet(f"background-color: white; border-radius: 14px; padding: 0 20px; border: 1px solid {BORDER_COLOR};")
         self.chat_input.returnPressed.connect(self.handle_send)
         layout.addWidget(self.chat_input)
         
@@ -284,60 +314,40 @@ class SQLAssistantApp(QMainWindow):
 
     def create_editor_panel(self):
         panel = QFrame()
+        panel.setStyleSheet(f"background-color: {PANEL_BG}; border-radius: 24px;")
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(15)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(20)
         
-        header = QLabel("Query Studio")
+        header = QLabel("Studio")
         header.setObjectName("panel_header")
         layout.addWidget(header)
         
         self.query_editor = QTextBrowser()
-        self.query_editor.setPlaceholderText("Synthesized SQL will appear here...")
+        self.query_editor.setStyleSheet(f"background-color: #0F172A; border-radius: 16px; border: none;")
         layout.addWidget(self.query_editor)
         
-        # Better Buttons
+        self.editor_status = QLabel("")
+        self.editor_status.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.editor_status.setStyleSheet("font-size: 11px; font-weight: 700;")
+        layout.addWidget(self.editor_status)
+        
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(10)
-        
-        self.commit_btn = QPushButton("Commit to Database")
-        self.commit_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {ACCENT_GREEN};
-                padding: 16px;
-                font-size: 14px;
-                border-radius: 16px;
-                font-weight: 800;
-            }}
-            QPushButton:hover {{ background-color: #059669; margin-top: -2px; }}
-        """)
+        btn_layout.addStretch()
         
         self.revert_btn = QPushButton("Revert")
-        self.revert_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: #1E293B;
-                border: 1px solid #334155;
-                padding: 16px;
-                border-radius: 16px;
-                color: #94A3B8;
-            }}
-            QPushButton:hover {{ background-color: {ACCENT_RED}; color: white; }}
-        """)
+        self.revert_btn.setStyleSheet(f"background-color: white; border: 1px solid {BORDER_COLOR}; color: {TEXT_SUBTLE};")
         
         self.copy_btn = QPushButton("Copy SQL")
-        self.copy_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {PRIMARY_PURPLE};
-                padding: 16px;
-                border-radius: 16px;
-                font-weight: bold;
-            }}
-            QPushButton:hover {{ background-color: {SECONDARY_PURPLE}; }}
-        """)
+        self.copy_btn.setStyleSheet(f"background-color: {PRIMARY_BLUE};")
         
-        btn_layout.addWidget(self.commit_btn, 2)
-        btn_layout.addWidget(self.revert_btn, 1)
-        btn_layout.addWidget(self.copy_btn, 1)
+        self.commit_btn = QPushButton("Commit")
+        self.commit_btn.setStyleSheet(f"background-color: {ACCENT_GREEN};")
+        
+        btn_layout.addWidget(self.revert_btn)
+        btn_layout.addWidget(self.copy_btn)
+        btn_layout.addWidget(self.commit_btn)
         layout.addLayout(btn_layout)
         
         self.commit_btn.clicked.connect(self.handle_commit)
@@ -348,59 +358,92 @@ class SQLAssistantApp(QMainWindow):
 
     def create_viewer_panel(self):
         panel = QFrame()
+        panel.setStyleSheet(f"background-color: {PANEL_BG}; border-radius: 24px;")
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(15)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(20)
         
-        header = QLabel("Data Source")
+        header = QLabel("Data")
         header.setObjectName("panel_header")
         layout.addWidget(header)
         
-        # Connection Card
         conn_card = QFrame()
-        conn_card.setStyleSheet(f"background-color: {CARD_BG}; border-radius: 20px; border: 1px solid #334155;")
-        c_layout = QVBoxLayout(conn_card)
-        c_layout.setSpacing(8)
+        conn_card.setStyleSheet(f"background-color: white; border-radius: 16px; border: 1px solid {BORDER_COLOR};")
+        clayout = QVBoxLayout(conn_card)
+        clayout.setSpacing(10)
         
         self.db_type = QComboBox()
-        self.db_type.addItems(["SQLite", "PostgreSQL"])
-        c_layout.addWidget(self.db_type)
+        self.db_type.addItems(["SQLite", "PostgreSQL", "MySQL"])
+        clayout.addWidget(self.db_type)
         
-        self.conn_input = QLineEdit("test.db")
-        c_layout.addWidget(self.conn_input)
+        # Connection Inputs
+        self.host_input = QLineEdit()
+        self.host_input.setPlaceholderText("Host (e.g. localhost)")
+        clayout.addWidget(self.host_input)
+        
+        self.user_input = QLineEdit()
+        self.user_input.setPlaceholderText("Username")
+        clayout.addWidget(self.user_input)
+        
+        self.pass_input = QLineEdit()
+        self.pass_input.setPlaceholderText("Password")
+        self.pass_input.setEchoMode(QLineEdit.EchoMode.Password)
+        clayout.addWidget(self.pass_input)
+        
+        self.db_name_input = QLineEdit()
+        self.db_name_input.setPlaceholderText("Database Name / Path")
+        clayout.addWidget(self.db_name_input)
+        
+        # Set defaults for user ease
+        self.host_input.setText("localhost")
+        self.user_input.setText("root")
+        self.db_name_input.setText("test.db")
         
         self.connect_btn = QPushButton("Sync Connection")
+        self.connect_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #DBEAFE;
+                color: {PRIMARY_BLUE};
+                border: none;
+                padding: 10px;
+                border-radius: 8px;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{ background-color: {PRIMARY_BLUE}; color: white; }}
+        """)
         self.connect_btn.clicked.connect(self.handle_connect)
-        c_layout.addWidget(self.connect_btn)
+        clayout.addWidget(self.connect_btn)
+        
+        self.conn_status_label = QLabel("")
+        self.conn_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.conn_status_label.setStyleSheet("font-size: 11px; font-weight: 700; margin-top: 4px;")
+        clayout.addWidget(self.conn_status_label)
         
         layout.addWidget(conn_card)
         
-        layout.addWidget(QLabel("Tables:"))
         self.table_list = QComboBox()
         self.table_list.currentTextChanged.connect(self.on_table_selected)
         layout.addWidget(self.table_list)
         
         self.results_table = QTableWidget()
-        self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         layout.addWidget(self.results_table)
         
         return panel
 
     def add_message(self, text, is_user=True):
-        bubble_container = QWidget()
-        bubble_layout = QHBoxLayout(bubble_container)
-        bubble_layout.setContentsMargins(0, 0, 0, 0)
-        
+        container = QWidget()
+        clayout = QHBoxLayout(container)
+        clayout.setContentsMargins(0, 0, 0, 0)
         bubble = ChatBubble(text, is_user)
         if is_user:
-            bubble_layout.addStretch()
-            bubble_layout.addWidget(bubble)
+            clayout.addStretch()
+            clayout.addWidget(bubble)
         else:
-            bubble_layout.addWidget(bubble)
-            bubble_layout.addStretch()
-            
+            clayout.addWidget(bubble)
+            clayout.addStretch()
+        
         self.chat_content_layout.takeAt(self.chat_content_layout.count() - 1)
-        self.chat_content_layout.addWidget(bubble_container)
+        self.chat_content_layout.addWidget(container)
         self.chat_content_layout.addStretch()
         
         if text != "Thinking...":
@@ -408,15 +451,13 @@ class SQLAssistantApp(QMainWindow):
             
         QApplication.processEvents()
         self.chat_history_area.verticalScrollBar().setValue(self.chat_history_area.verticalScrollBar().maximum())
-        return bubble_container
+        return container
 
     def handle_send(self):
         text = self.chat_input.text().strip()
         if not text: return
-        
         self.add_message(text, is_user=True)
         self.chat_input.clear()
-        
         self.thinking_message = self.add_message("Thinking...", is_user=False)
         self.ai_thread = AILogicThread(self.conversation_history, self.current_objective)
         self.ai_thread.response_ready.connect(self.on_ai_response)
@@ -426,23 +467,17 @@ class SQLAssistantApp(QMainWindow):
     def on_ai_response(self, text, new_task):
         self.chat_content_layout.removeWidget(self.thinking_message)
         self.thinking_message.deleteLater()
-        
         if new_task and (not self.current_objective or len(new_task) > 5):
             self.current_objective = new_task
             self.obj_label.setText(f"Current Objective: {self.current_objective}")
-            
         self.add_message(text, is_user=False)
         
-        # Robust SQL Extraction including fallback
-        sql_match = re.search(r'```sql\s*(.*?)\s*```', text, re.DOTALL | re.IGNORECASE)
-        if sql_match:
-            self.update_query_editor(sql_match.group(1).strip())
-        elif any(kw in text.upper() for kw in ["SELECT ", "UPDATE ", "INSERT "]):
-            # Try to grab the first block of text that looks like a query
-            lines = text.split('\n')
-            query_lines = [l for l in lines if any(kw in l.upper() for kw in ["SELECT", "FROM", "WHERE", "JOIN", "UPDATE", "SET"])]
-            if query_lines:
-                self.update_query_editor("\n".join(query_lines).strip())
+        # Robust SQL Extraction - capture multiple blocks if present
+        sql_blocks = re.findall(r'```sql\s*(.*?)\s*```', text, re.DOTALL | re.IGNORECASE)
+        if sql_blocks:
+            # Combine or take the last one as the primary "requirement"
+            full_sql = "\n\n".join([b.strip() for b in sql_blocks])
+            self.update_query_editor(full_sql)
 
     def on_ai_error(self, error):
         if hasattr(self, 'thinking_message'):
@@ -455,48 +490,50 @@ class SQLAssistantApp(QMainWindow):
         self.current_objective = None
         self.obj_label.setText("Current Objective: Waiting for input...")
         self.query_editor.clear()
-        
-        # Clear chat layout
         while self.chat_content_layout.count() > 1:
             item = self.chat_content_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            if item.widget(): item.widget().deleteLater()
         self.status_bar.showMessage("Neural Sync Complete. Context reset.", 3000)
 
     def update_query_editor(self, sql):
         formatter = HtmlFormatter(nowrap=True, style='monokai')
         highlighted = highlight(sql, SqlLexer(), formatter)
         css = formatter.get_style_defs('.highlight')
-        
-        html = f"""
-        <html><head><style>
-            {css}
-            .highlight {{ background: transparent; color: #f8f8f2; }}
-            pre {{ font-family: 'JetBrains Mono', monospace; font-size: 15px; line-height: 1.6; margin: 0; }}
-        </style></head>
-        <body><div class='highlight'><pre>{highlighted}</pre></div></body></html>
-        """
+        # Professional dark editor for the code section even in light theme
+        html = f"<html><head><style>{css} .highlight {{ background: transparent; color: #f8f8f2; }} pre {{ font-family: 'JetBrains Mono', monospace; font-size: 14px; margin: 0; padding: 10px; }}</style></head><body><div class='highlight'><pre>{highlighted}</pre></div></body></html>"
         self.query_editor.setHtml(html)
 
     def handle_connect(self):
         try:
-            if self.db_type.currentText() == "SQLite":
-                self.conn = sqlite3.connect(self.conn_input.text())
-            else:
-                self.conn = psycopg2.connect(self.conn_input.text()) # simplified for now
+            db_type = self.db_type.currentText()
+            h, u, p, d = self.host_input.text(), self.user_input.text(), self.pass_input.text(), self.db_name_input.text()
+            
+            if db_type == "SQLite":
+                self.conn = sqlite3.connect(d)
+            elif db_type == "PostgreSQL":
+                self.conn = psycopg2.connect(host=h, user=u, password=p, dbname=d)
+            elif db_type == "MySQL":
+                self.conn = mysql.connector.connect(host=h, user=u, password=p, database=d)
                 
+            self.conn_status_label.setText("CONNECTED")
+            self.conn_status_label.setStyleSheet(f"color: {ACCENT_GREEN}; font-size: 11px; font-weight: 700;")
             self.status_bar.showMessage("Neural Sync Success", 2000)
             self.refresh_tables()
         except Exception as e:
+            self.conn_status_label.setText("CONNECTION FAILED")
+            self.conn_status_label.setStyleSheet(f"color: {ACCENT_RED}; font-size: 11px; font-weight: 700;")
             self.status_bar.showMessage(f"Sync Fail: {e}")
 
     def refresh_tables(self):
         cursor = self.conn.cursor()
-        if self.db_type.currentText() == "SQLite":
+        db_type = self.db_type.currentText()
+        if db_type == "SQLite":
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        else:
+        elif db_type == "PostgreSQL":
             cursor.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='public';")
-        
+        elif db_type == "MySQL":
+            cursor.execute("SHOW TABLES;")
+
         tables = [r[0] for r in cursor.fetchall()]
         self.table_list.clear()
         self.table_list.addItems(tables)
@@ -505,18 +542,26 @@ class SQLAssistantApp(QMainWindow):
         if name: self.execute_query(f"SELECT * FROM {name} LIMIT 100;")
 
     def handle_commit(self):
+        if not hasattr(self, 'conn') or self.conn is None:
+            self.editor_status.setText("NOT CONNECTED")
+            self.editor_status.setStyleSheet(f"color: {ACCENT_RED}; font-size: 11px; font-weight: 700;")
+            return
+            
         sql = self.query_editor.toPlainText()
-        if sql and hasattr(self, 'conn'): self.execute_query(sql)
+        if sql: self.execute_query(sql)
 
     def execute_query(self, sql):
         try:
             cursor = self.conn.cursor()
             cursor.execute(sql)
-            if any(m in sql.upper() for m in ["INSERT", "UPDATE", "DELETE"]):
+            
+            self.editor_status.setText("EXECUTION SUCCESS")
+            self.editor_status.setStyleSheet(f"color: {ACCENT_GREEN}; font-size: 11px; font-weight: 700;")
+            
+            if any(m in sql.upper() for m in ["INSERT", "UPDATE", "DELETE", "CREATE", "DROP"]):
                 self.conn.commit()
                 self.refresh_tables()
                 return
-            
             rows = cursor.fetchall()[:100]
             cols = [d[0] for d in cursor.description]
             self.results_table.setColumnCount(len(cols))
@@ -526,6 +571,8 @@ class SQLAssistantApp(QMainWindow):
                 for j, v in enumerate(r):
                     self.results_table.setItem(i, j, QTableWidgetItem(str(v)))
         except Exception as e:
+            self.editor_status.setText("EXECUTION FAILED")
+            self.editor_status.setStyleSheet(f"color: {ACCENT_RED}; font-size: 11px; font-weight: 700;")
             self.status_bar.showMessage(f"Execution Error: {e}")
 
     def handle_copy(self):
@@ -538,7 +585,7 @@ class SQLAssistantApp(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setStyle("Fusion") # Better base for custom CSS
+    app.setStyle("Fusion")
     window = SQLAssistantApp()
     window.show()
     sys.exit(app.exec())
