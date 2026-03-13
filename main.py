@@ -5,6 +5,7 @@ import sqlite3
 import psycopg2
 import mysql.connector
 import ollama
+import google.generativeai as genai
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QSplitter, QTextBrowser, QLineEdit, QPushButton, QScrollArea,
@@ -17,6 +18,31 @@ import config
 from pygments import highlight
 from pygments.lexers import SqlLexer
 from pygments.formatters import HtmlFormatter
+import json
+
+# --- SAP Metadata Dictionary ---
+SAP_METADATA = {
+    "Material": {
+        "tables": {
+            "MARA": {"description": "General Material Data", "fields": ["MATNR", "MTART", "MATKL"]},
+            "MARC": {"description": "Plant Data for Material", "fields": ["WERKS", "EKGRP", "BESKZ"]},
+            "MAKT": {"description": "Material Description", "fields": ["MAKTX", "SPRAS"]},
+            "MVKE": {"description": "Sales Data", "fields": ["VKORG", "VTWEG"]}
+        },
+        "joins": [
+            "MARA.MATNR = MARC.MATNR",
+            "MARA.MATNR = MAKT.MATNR",
+            "MARA.MATNR = MVKE.MATNR"
+        ],
+        "all_fields": [
+            {"table": "MARA", "fields": ["MATNR", "MTART", "MATKL"]},
+            {"table": "MARC", "fields": ["WERKS", "EKGRP", "BESKZ"]},
+            {"table": "MAKT", "fields": ["MAKTX", "SPRAS"]},
+            {"table": "MVKE", "fields": ["VKORG", "VTWEG"]}
+        ],
+        "base_table": "MARA"
+    }
+}
 
 # --- UI Constants (Premium Light Theme) ---
 PRIMARY_BLUE = "#2563EB"    # Sharp Professional Blue
@@ -88,28 +114,74 @@ class AILogicThread(QThread):
     response_ready = pyqtSignal(str, str)
     error_signal = pyqtSignal(str)
 
-    def __init__(self, history, current_task):
+    def __init__(self, history, current_objective, ai_provider, db_context="", conn_params=None):
         super().__init__()
         self.history = history
-        self.current_task = current_task
+        self.current_objective = current_objective
+        self.ai_provider = ai_provider
+        self.db_context = db_context
+        self.conn_params = conn_params
 
     def run(self):
         try:
-            task_context = f"CURRENT TASK OBJECTIVE: {self.current_task}\n" if self.current_task else ""
+            task_context = f"CURRENT TASK OBJECTIVE: {self.current_objective}\n" if self.current_objective else ""
+            db_info = f"\nCONNECTED DATABASE CONTEXT:\n{self.db_context}\n" if self.db_context else ""
             system_prompt = (
-                "You are the SQL Intelligence. Focus ONLY on providing clean, executable SQL code.\n"
+                "You are the SAP SQL EXPERT. You MUST follow this EXACT logic for query generation.\n\n"
+                "SAP METADATA DICTIONARY:\n"
+                f"{json.dumps(SAP_METADATA, indent=2)}\n\n"
+                "STRICT 10-STEP SOP:\n"
+                "1. DOMAIN: Identify the domain (e.g., Material).\n"
+                "2. ALL FIELDS: You MUST return EVERY field listed in 'all_fields' for that domain in the SELECT list.\n"
+                "3. MINIMAL TABLES: Identify ONLY the tables required for requested data or validation.\n"
+                "4. NA RULE: If a table is NOT used in the JOIN, replace its fields in the SELECT with 'NA' AS FIELD_NAME.\n"
+                "5. SCHEMA: Prefix EVERY table with 'prd_tme.' (unless specified otherwise in context).\n"
+                "6. JOINS: Use ONLY the joins specified in the metadata dictionary. NEVER invent joins.\n"
+                "7. VALIDATION: If the user asks for a check/flag, add EXACTLY ONE column: CASE WHEN [rule] THEN 1 ELSE 0 END AS ERROR_CONDITION.\n"
+                "8. STRUCTURE: Construct SELECT, FROM, JOIN structure clearly.\n"
+                "9. VALIDATE: Double-check that all 'all_fields' are present and 'NA' is used correctly.\n"
+                "10. OUTPUT: Return ONLY the SQL code block. No explanations, no text before or after.\n\n"
+                "TECHNICAL CONSTRAINTS:\n"
+                "1. Use ONLY SQL code blocks (```sql ... ```).\n"
+                "2. NO extra text. Just SQL.\n"
                 f"{task_context}"
-                "CRITICAL INSTRUCTIONS:\n"
-                "1. DO NOT generate ASCII tables, example data, or markdown tables (+---+|).\n"
-                "2. Provide only SQL code blocks for the user to execute.\n"
-                "3. If database context is missing, ask for Host, Username, and Table.\n"
-                "4. End with TASK_OBJECTIVE: [short description]"
+                f"{db_info}"
             )
-            messages = [{"role": "system", "content": system_prompt}]
-            messages.extend(self.history)
-            response = ollama.chat(model=config.LLAMA_MODEL_NAME, messages=messages)
-            content = response['message']['content']
-            new_task = self.current_task
+            
+            for attempt in range(3): # AI has 3 attempts to get it right
+                if self.ai_provider == "gemini":
+                    genai.configure(api_key=config.GEMINI_API_KEY)
+                    model = genai.GenerativeModel('gemini-2.5-flash')
+                    
+                    # Convert history to Gemini format
+                    gemini_history = []
+                    for msg in self.history:
+                        role = "user" if msg["role"] == "user" else "model"
+                        gemini_history.append({"role": role, "parts": [msg["content"]]})
+                    
+                    chat = model.start_chat(history=gemini_history)
+                    input_text = system_prompt + "\n\nUser request: " + self.history[-1]["content"] if attempt == 0 else self.history[-1]["content"]
+                    response = chat.send_message(input_text)
+                    content = response.text
+                else:
+                    messages = [{"role": "system", "content": system_prompt}]
+                    messages.extend(self.history)
+                    response = ollama.chat(model=config.LLAMA_MODEL_NAME, messages=messages)
+                    content = response['message']['content']
+                
+                # Extract SQL for verification
+                sql_match = re.search(r'```sql\s*(.*?)\s*```', content, re.DOTALL | re.IGNORECASE)
+                if sql_match and self.conn_params:
+                    sql = sql_match.group(1).strip()
+                    error = self._verify_sql(sql)
+                    if error:
+                        # Feed the error back to the AI context for next iteration
+                        self.history.append({"role": "assistant", "content": content})
+                        self.history.append({"role": "user", "content": f"Verification Error: The SQL you provided failed with the following error:\n{error}\nPlease analyze this error, fix the query, and provide the corrected version within a new SQL block."})
+                        continue # Retry
+                break # Success or no SQL to verify
+                
+            new_task = self.current_objective
             task_match = re.search(r'TASK_OBJECTIVE:\s*(.*)', content, re.IGNORECASE)
             if task_match:
                 new_task = task_match.group(1).strip()
@@ -118,6 +190,39 @@ class AILogicThread(QThread):
         except Exception as e:
             self.error_signal.emit(str(e))
 
+    def _verify_sql(self, sql):
+        """Helper to test SQL against the database (always rolls back)"""
+        try:
+            if not self.conn_params: return None
+            
+            db_type = self.conn_params['type']
+            h = self.conn_params['host']
+            u = self.conn_params['user']
+            p = self.conn_params['pass']
+            d = self.conn_params['name']
+            
+            if db_type == "SQLite":
+                conn = sqlite3.connect(d)
+            elif db_type == "PostgreSQL":
+                if ":" in h:
+                    host, port = h.split(":")
+                    conn = psycopg2.connect(host=host, port=port, user=u, password=p, dbname=d)
+                else:
+                    conn = psycopg2.connect(host=h, user=u, password=p, dbname=d)
+            elif db_type == "MySQL":
+                port = 3306
+                if ":" in h: h, port = h.split(":")
+                conn = mysql.connector.connect(host=h, port=port, user=u, password=p, database=d)
+            
+            cursor = conn.cursor()
+            cursor.execute(sql)
+            # Important: Always rollback to keep verification side-effect free
+            conn.rollback()
+            conn.close()
+            return None # Success
+        except Exception as e:
+            return str(e)
+
 class SQLAssistantApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -125,6 +230,7 @@ class SQLAssistantApp(QMainWindow):
         self.setMinimumSize(1400, 950)
         self.conversation_history = []
         self.current_objective = None
+        self.db_context_info = ""
         
         self._apply_global_styles()
         
@@ -273,7 +379,29 @@ class SQLAssistantApp(QMainWindow):
         """)
         self.new_task_btn.clicked.connect(self.handle_new_task)
         
+        self.model_selector = QComboBox()
+        self.model_selector.addItems(["Gemini", "Llama"])
+        self.model_selector.setStyleSheet(f"""
+            QComboBox {{
+                background-color: white;
+                border: 1px solid {BORDER_COLOR};
+                border-radius: 8px;
+                padding: 4px 8px;
+                font-size: 11px;
+                color: {TEXT_SUBTLE};
+                min-width: 80px;
+            }}
+            QComboBox::drop-down {{ border: none; }}
+            QComboBox::down-arrow {{ image: none; border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 5px solid {TEXT_SUBTLE}; margin-right: 8px; }}
+        """)
+        # Set default based on config
+        if config.AI_PROVIDER == "gemini":
+            self.model_selector.setCurrentText("Gemini")
+        else:
+            self.model_selector.setCurrentText("Llama")
+
         header_layout.addWidget(header)
+        header_layout.addWidget(self.model_selector)
         header_layout.addStretch()
         header_layout.addWidget(self.new_task_btn)
         layout.addLayout(header_layout)
@@ -465,7 +593,20 @@ class SQLAssistantApp(QMainWindow):
         self.add_message(text, is_user=True)
         self.chat_input.clear()
         self.thinking_message = self.add_message("Thinking...", is_user=False)
-        self.ai_thread = AILogicThread(self.conversation_history, self.current_objective)
+        provider = self.model_selector.currentText().lower()
+        
+        # Pass connection params for verification loop
+        conn_params = None
+        if hasattr(self, 'conn') and self.conn:
+            conn_params = {
+                'type': self.db_type.currentText(),
+                'host': self.host_input.text(),
+                'user': self.user_input.text(),
+                'pass': self.pass_input.text(),
+                'name': self.db_name_input.text()
+            }
+            
+        self.ai_thread = AILogicThread(self.conversation_history, self.current_objective, provider, self.db_context_info, conn_params)
         self.ai_thread.response_ready.connect(self.on_ai_response)
         self.ai_thread.error_signal.connect(self.on_ai_error)
         self.ai_thread.start()
@@ -543,8 +684,9 @@ class SQLAssistantApp(QMainWindow):
             if self.conn.is_connected():
                 self.conn_status_label.setText("connected")
                 self.conn_status_label.setStyleSheet(f"color: {ACCENT_GREEN}; font-size: 11px; font-weight: 700;")
-                self.status_bar.showMessage("Neural Sync Success", 2000)
+                self.status_bar.showMessage("Neural Sync Success | Learning Database...", 5000)
                 self.refresh_tables()
+                self.fetch_database_context()
             else:
                 raise Exception("Failed to establish connection")
         except Exception as e:
@@ -565,6 +707,44 @@ class SQLAssistantApp(QMainWindow):
         tables = [r[0] for r in cursor.fetchall()]
         self.table_list.clear()
         self.table_list.addItems(tables)
+        return tables
+
+    def fetch_database_context(self):
+        try:
+            cursor = self.conn.cursor()
+            tables = self.refresh_tables()
+            context = "Detailed Database Schema:\n"
+            
+            for table in tables[:15]: # Limit to first 15 tables for context efficiency
+                context += f"- Table: {table}\n"
+                
+                db_type = self.db_type.currentText()
+                if db_type == "SQLite":
+                    cursor.execute(f"PRAGMA table_info({table});")
+                    cols = [f"{r[1]} ({r[2]})" for r in cursor.fetchall()]
+                elif db_type == "PostgreSQL":
+                    cursor.execute(f"SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '{table}';")
+                    cols = [f"{r[0]} ({r[1]})" for r in cursor.fetchall()]
+                elif db_type == "MySQL":
+                    cursor.execute(f"DESCRIBE {table};")
+                    cols = [f"{r[0]} ({r[1]})" for r in cursor.fetchall()]
+                
+                context += f"  Columns: {', '.join(cols)}\n"
+                
+                # Sample data
+                try:
+                    cursor.execute(f"SELECT * FROM {table} LIMIT 2;")
+                    sample = cursor.fetchall()
+                    if sample:
+                        context += f"  Sample Data: {str(sample)}\n"
+                except:
+                    pass
+            
+            self.db_context_info = context
+            self.status_bar.showMessage("Neural Sync Success | AI Mind Synced with DB", 3000)
+        except Exception as e:
+            print(f"Failed to fetch context: {e}")
+            self.db_context_info = "Schema retrieval failed, using fallback knowledge."
 
     def on_table_selected(self, name):
         if name: self.execute_query(f"SELECT * FROM {name} LIMIT 100;")
@@ -592,9 +772,12 @@ class SQLAssistantApp(QMainWindow):
                 return
             rows = cursor.fetchall()[:100]
             cols = [d[0] for d in cursor.description]
+            
+            # Update results table in the third panel
             self.results_table.setColumnCount(len(cols))
             self.results_table.setRowCount(len(rows))
             self.results_table.setHorizontalHeaderLabels(cols)
+            self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
             for i, r in enumerate(rows):
                 for j, v in enumerate(r):
                     self.results_table.setItem(i, j, QTableWidgetItem(str(v)))
